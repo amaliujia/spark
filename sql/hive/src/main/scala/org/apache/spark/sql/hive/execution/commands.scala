@@ -22,11 +22,12 @@ import org.apache.spark.sql.catalyst.analysis.EliminateSubQueries
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.{SaveMode, DataFrame, SQLContext}
-import org.apache.spark.sql.catalyst.expressions.Row
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Row}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.RunnableCommand
 import org.apache.spark.sql.hive.HiveContext
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
 
 /**
  * Analyzes the given table in the current database to generate statistics, which will be
@@ -38,7 +39,7 @@ import org.apache.spark.sql.types.StructType
 private[hive]
 case class AnalyzeTable(tableName: String) extends RunnableCommand {
 
-  override def run(sqlContext: SQLContext) = {
+  override def run(sqlContext: SQLContext): Seq[Row] = {
     sqlContext.asInstanceOf[HiveContext].analyze(tableName)
     Seq.empty[Row]
   }
@@ -52,18 +53,19 @@ case class DropTable(
     tableName: String,
     ifExists: Boolean) extends RunnableCommand {
 
-  override def run(sqlContext: SQLContext) = {
+  override def run(sqlContext: SQLContext): Seq[Row] = {
     val hiveContext = sqlContext.asInstanceOf[HiveContext]
     val ifExistsClause = if (ifExists) "IF EXISTS " else ""
     try {
       hiveContext.cacheManager.tryUncacheQuery(hiveContext.table(tableName))
     } catch {
-      // This table's metadata is not in
+      // This table's metadata is not in Hive metastore (e.g. the table does not exist).
       case _: org.apache.hadoop.hive.ql.metadata.InvalidTableException =>
+      case _: org.apache.spark.sql.catalyst.analysis.NoSuchTableException =>
       // Other Throwables can be caused by users providing wrong parameters in OPTIONS
       // (e.g. invalid paths). We catch it and log a warning message.
       // Users should be able to drop such kinds of tables regardless if there is an error.
-      case e: Throwable => log.warn(s"${e.getMessage}")
+      case e: Throwable => log.warn(s"${e.getMessage}", e)
     }
     hiveContext.invalidateTable(tableName)
     hiveContext.runSqlHive(s"DROP TABLE $ifExistsClause$tableName")
@@ -75,18 +77,36 @@ case class DropTable(
 private[hive]
 case class AddJar(path: String) extends RunnableCommand {
 
-  override def run(sqlContext: SQLContext) = {
+  override val output: Seq[Attribute] = {
+    val schema = StructType(
+      StructField("result", IntegerType, false) :: Nil)
+    schema.toAttributes
+  }
+
+  override def run(sqlContext: SQLContext): Seq[Row] = {
     val hiveContext = sqlContext.asInstanceOf[HiveContext]
+    val currentClassLoader = Utils.getContextOrSparkClassLoader
+
+    // Add jar to current context
+    val jarURL = new java.io.File(path).toURL
+    val newClassLoader = new java.net.URLClassLoader(Array(jarURL), currentClassLoader)
+    Thread.currentThread.setContextClassLoader(newClassLoader)
+    org.apache.hadoop.hive.ql.metadata.Hive.get().getConf().setClassLoader(newClassLoader)
+
+    // Add jar to isolated hive classloader
     hiveContext.runSqlHive(s"ADD JAR $path")
+
+    // Add jar to executors
     hiveContext.sparkContext.addJar(path)
-    Seq.empty[Row]
+
+    Seq(Row(0))
   }
 }
 
 private[hive]
 case class AddFile(path: String) extends RunnableCommand {
 
-  override def run(sqlContext: SQLContext) = {
+  override def run(sqlContext: SQLContext): Seq[Row] = {
     val hiveContext = sqlContext.asInstanceOf[HiveContext]
     hiveContext.runSqlHive(s"ADD FILE $path")
     hiveContext.sparkContext.addFile(path)

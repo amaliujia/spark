@@ -91,21 +91,21 @@ object LogisticRegressionSuite {
       seed: Int): Seq[LabeledPoint] = {
     val rnd = new Random(seed)
 
-    val xDim = xMean.size
+    val xDim = xMean.length
     val xWithInterceptsDim = if (addIntercept) xDim + 1 else xDim
-    val nClasses = weights.size / xWithInterceptsDim + 1
+    val nClasses = weights.length / xWithInterceptsDim + 1
 
     val x = Array.fill[Vector](nPoints)(Vectors.dense(Array.fill[Double](xDim)(rnd.nextGaussian())))
 
-    x.map(vector => {
+    x.foreach { vector =>
       // This doesn't work if `vector` is a sparse vector.
       val vectorArray = vector.toArray
       var i = 0
-      while (i < vectorArray.size) {
+      while (i < vectorArray.length) {
         vectorArray(i) = vectorArray(i) * math.sqrt(xVariance(i)) + xMean(i)
         i += 1
       }
-    })
+    }
 
     val y = (0 until nPoints).map { idx =>
       val xArray = x(idx).toArray
@@ -424,6 +424,12 @@ class LogisticRegressionSuite extends FunSuite with MLlibTestSparkContext with M
     lr.optimizer.setConvergenceTol(1E-15).setNumIterations(200)
 
     val model = lr.run(testRDD)
+
+    val numFeatures = testRDD.map(_.features.size).first()
+    val initialWeights = Vectors.dense(new Array[Double]((numFeatures + 1) * 2))
+    val model2 = lr.run(testRDD, initialWeights)
+
+    LogisticRegressionSuite.checkModelsEqual(model, model2)
 
     /**
      * The following is the instruction to reproduce the model using R's glmnet package.

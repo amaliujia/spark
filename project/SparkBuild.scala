@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import java.io.File
+import java.io._
 
 import scala.util.Properties
 import scala.collection.JavaConversions._
@@ -34,11 +34,11 @@ object BuildCommons {
 
   val allProjects@Seq(bagel, catalyst, core, graphx, hive, hiveThriftServer, mllib, repl,
     sql, networkCommon, networkShuffle, streaming, streamingFlumeSink, streamingFlume, streamingKafka,
-    streamingMqtt, streamingTwitter, streamingZeromq) =
+    streamingMqtt, streamingTwitter, streamingZeromq, launcher, unsafe) =
     Seq("bagel", "catalyst", "core", "graphx", "hive", "hive-thriftserver", "mllib", "repl",
       "sql", "network-common", "network-shuffle", "streaming", "streaming-flume-sink",
       "streaming-flume", "streaming-kafka", "streaming-mqtt", "streaming-twitter",
-      "streaming-zeromq").map(ProjectRef(buildLocation, _))
+      "streaming-zeromq", "launcher", "unsafe").map(ProjectRef(buildLocation, _))
 
   val optionallyEnabledProjects@Seq(yarn, yarnStable, java8Tests, sparkGangliaLgpl,
     sparkKinesisAsl) = Seq("yarn", "yarn-stable", "java8-tests", "ganglia-lgpl",
@@ -119,7 +119,9 @@ object SparkBuild extends PomBuild {
   lazy val publishLocalBoth = TaskKey[Unit]("publish-local", "publish local for m2 and ivy")
 
   lazy val sharedSettings = graphSettings ++ genjavadocSettings ++ Seq (
-    javaHome   := Properties.envOrNone("JAVA_HOME").map(file),
+    javaHome := sys.env.get("JAVA_HOME")
+      .orElse(sys.props.get("java.home").map { p => new File(p).getParentFile().getAbsolutePath() })
+      .map(file),
     incOptions := incOptions.value.withNameHashing(true),
     retrieveManaged := true,
     retrievePattern := "[type]s/[artifact](-[revision])(-[classifier]).[ext]",
@@ -154,14 +156,20 @@ object SparkBuild extends PomBuild {
   /* Enable tests settings for all projects except examples, assembly and tools */
   (allProjects ++ optionallyEnabledProjects).foreach(enable(TestSettings.settings))
 
-  // TODO: Add Sql to mima checks
-  allProjects.filterNot(x => Seq(spark, sql, hive, hiveThriftServer, catalyst, repl,
-    networkCommon, networkShuffle, networkYarn).contains(x)).foreach {
+  // TODO: remove launcher from this list after 1.4.0
+  allProjects.filterNot(x => Seq(spark, hive, hiveThriftServer, catalyst, repl,
+    networkCommon, networkShuffle, networkYarn, launcher, unsafe).contains(x)).foreach {
       x => enable(MimaBuild.mimaSettings(sparkHome, x))(x)
     }
 
+  /* Unsafe settings */
+  enable(Unsafe.settings)(unsafe)
+
   /* Enable Assembly for all assembly projects */
   assemblyProjects.foreach(enable(Assembly.settings))
+
+  /* Package pyspark artifacts in the main assembly. */
+  enable(PySparkAssembly.settings)(assembly)
 
   /* Enable unidoc only for the root spark project */
   enable(Unidoc.settings)(spark)
@@ -185,6 +193,7 @@ object SparkBuild extends PomBuild {
    * Usage: `build/sbt sparkShell`
    */
   val sparkShell = taskKey[Unit]("start a spark-shell.")
+  val sparkSql = taskKey[Unit]("starts the spark sql CLI.")
 
   enable(Seq(
     connectInput in run := true,
@@ -195,6 +204,12 @@ object SparkBuild extends PomBuild {
 
     sparkShell := {
       (runMain in Compile).toTask(" org.apache.spark.repl.Main -usejavacp").value
+    },
+
+    javaOptions in Compile += "-Dspark.master=local",
+
+    sparkSql := {
+      (runMain in Compile).toTask(" org.apache.spark.sql.hive.thriftserver.SparkSQLCLIDriver").value
     }
   ))(assembly)
 
@@ -208,6 +223,13 @@ object SparkBuild extends PomBuild {
     } ++ Seq[Project](OldDeps.project)
   }
 
+}
+
+object Unsafe {
+  lazy val settings = Seq(
+    // This option is needed to suppress warnings from sun.misc.Unsafe usage
+    javacOptions in Compile += "-XDignore.symbol.file"
+  )
 }
 
 object Flume {
@@ -268,11 +290,10 @@ object SQL {
         |import org.apache.spark.sql.catalyst.plans.logical._
         |import org.apache.spark.sql.catalyst.rules._
         |import org.apache.spark.sql.catalyst.util._
-        |import org.apache.spark.sql.Dsl._
         |import org.apache.spark.sql.execution
+        |import org.apache.spark.sql.functions._
         |import org.apache.spark.sql.test.TestSQLContext._
-        |import org.apache.spark.sql.types._
-        |import org.apache.spark.sql.parquet.ParquetTestData""".stripMargin,
+        |import org.apache.spark.sql.types._""".stripMargin,
     cleanupCommands in console := "sparkContext.stop()"
   )
 }
@@ -299,12 +320,11 @@ object Hive {
         |import org.apache.spark.sql.catalyst.plans.logical._
         |import org.apache.spark.sql.catalyst.rules._
         |import org.apache.spark.sql.catalyst.util._
-        |import org.apache.spark.sql.Dsl._
         |import org.apache.spark.sql.execution
+        |import org.apache.spark.sql.functions._
         |import org.apache.spark.sql.hive._
         |import org.apache.spark.sql.hive.test.TestHive._
-        |import org.apache.spark.sql.types._
-        |import org.apache.spark.sql.parquet.ParquetTestData""".stripMargin,
+        |import org.apache.spark.sql.types._""".stripMargin,
     cleanupCommands in console := "sparkContext.stop()",
     // Some of our log4j jars make it impossible to submit jobs from this JVM to Hive Map/Reduce
     // in order to generate golden files.  This is only required for developers who are adding new
@@ -315,6 +335,7 @@ object Hive {
 }
 
 object Assembly {
+  import sbtassembly.AssemblyUtils._
   import sbtassembly.Plugin._
   import AssemblyKeys._
 
@@ -346,6 +367,93 @@ object Assembly {
   )
 }
 
+object PySparkAssembly {
+  import sbtassembly.Plugin._
+  import AssemblyKeys._
+  import java.util.zip.{ZipOutputStream, ZipEntry}
+
+  lazy val settings = Seq(
+    unmanagedJars in Compile += { BuildCommons.sparkHome / "python/lib/py4j-0.8.2.1-src.zip" },
+    // Use a resource generator to copy all .py files from python/pyspark into a managed directory
+    // to be included in the assembly. We can't just add "python/" to the assembly's resource dir
+    // list since that will copy unneeded / unwanted files.
+    resourceGenerators in Compile <+= resourceManaged in Compile map { outDir: File =>
+      val src = new File(BuildCommons.sparkHome, "python/pyspark")
+
+      val zipFile = new File(BuildCommons.sparkHome , "python/lib/pyspark.zip")
+      zipFile.delete()
+      zipRecursive(src, zipFile)
+
+      val dst = new File(outDir, "pyspark")
+      if (!dst.isDirectory()) {
+        require(dst.mkdirs())
+      }
+      copy(src, dst)
+    }
+  )
+
+  private def zipRecursive(source: File, destZipFile: File) = {
+    val destOutput = new ZipOutputStream(new FileOutputStream(destZipFile))
+    addFilesToZipStream("", source, destOutput)
+    destOutput.flush()
+    destOutput.close()
+  }
+
+  private def addFilesToZipStream(parent: String, source: File, output: ZipOutputStream): Unit = {
+    if (source.isDirectory()) {
+      output.putNextEntry(new ZipEntry(parent + source.getName()))
+      for (file <- source.listFiles()) {
+        addFilesToZipStream(parent + source.getName() + File.separator, file, output)
+      }
+    } else {
+      val in = new FileInputStream(source)
+      output.putNextEntry(new ZipEntry(parent + source.getName()))
+      val buf = new Array[Byte](8192)
+      var n = 0
+      while (n != -1) {
+        n = in.read(buf)
+        if (n != -1) {
+          output.write(buf, 0, n)
+        }
+      }
+      in.close()
+    }
+  }
+
+  private def copy(src: File, dst: File): Seq[File] = {
+    src.listFiles().flatMap { f =>
+      val child = new File(dst, f.getName())
+      if (f.isDirectory()) {
+        child.mkdir()
+        copy(f, child)
+      } else if (f.getName().endsWith(".py")) {
+        var in: Option[FileInputStream] = None
+        var out: Option[FileOutputStream] = None
+        try {
+          in = Some(new FileInputStream(f))
+          out = Some(new FileOutputStream(child))
+
+          val bytes = new Array[Byte](1024)
+          var read = 0
+          while (read >= 0) {
+            read = in.get.read(bytes)
+            if (read > 0) {
+              out.get.write(bytes, 0, read)
+            }
+          }
+
+          Some(child)
+        } finally {
+          in.foreach(_.close())
+          out.foreach(_.close())
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
 object Unidoc {
 
   import BuildCommons._
@@ -361,15 +469,16 @@ object Unidoc {
     packages
       .map(_.filterNot(_.getName.contains("$")))
       .map(_.filterNot(_.getCanonicalPath.contains("akka")))
-      .map(_.filterNot(_.getCanonicalPath.contains("deploy")))
-      .map(_.filterNot(_.getCanonicalPath.contains("network")))
-      .map(_.filterNot(_.getCanonicalPath.contains("shuffle")))
-      .map(_.filterNot(_.getCanonicalPath.contains("executor")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/deploy")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/network")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/shuffle")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/executor")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/unsafe")))
       .map(_.filterNot(_.getCanonicalPath.contains("python")))
-      .map(_.filterNot(_.getCanonicalPath.contains("collection")))
-      .map(_.filterNot(_.getCanonicalPath.contains("sql/catalyst")))
-      .map(_.filterNot(_.getCanonicalPath.contains("sql/execution")))
-      .map(_.filterNot(_.getCanonicalPath.contains("sql/hive/test")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/util/collection")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/sql/catalyst")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/sql/execution")))
+      .map(_.filterNot(_.getCanonicalPath.contains("org/apache/spark/sql/hive/test")))
   }
 
   lazy val settings = scalaJavaUnidocSettings ++ Seq (
@@ -407,7 +516,8 @@ object Unidoc {
         "mllib.tree.impurity", "mllib.tree.model", "mllib.util",
         "mllib.evaluation", "mllib.feature", "mllib.random", "mllib.stat.correlation",
         "mllib.stat.test", "mllib.tree.impl", "mllib.tree.loss",
-        "ml", "ml.classification", "ml.evaluation", "ml.feature", "ml.param", "ml.tuning"
+        "ml", "ml.attribute", "ml.classification", "ml.evaluation", "ml.feature", "ml.param",
+        "ml.recommendation", "ml.regression", "ml.tuning"
       ),
       "-group", "Spark SQL", packageList("sql.api.java", "sql.api.java.types", "sql.hive.api.java"),
       "-noqualifier", "java.lang"
@@ -426,14 +536,17 @@ object TestSettings {
     fork := true,
     // Setting SPARK_DIST_CLASSPATH is a simple way to make sure any child processes
     // launched by the tests have access to the correct test-time classpath.
-    envVars in Test += ("SPARK_DIST_CLASSPATH" ->
-      (fullClasspath in Test).value.files.map(_.getAbsolutePath).mkString(":").stripSuffix(":")),
+    envVars in Test ++= Map(
+      "SPARK_DIST_CLASSPATH" ->
+        (fullClasspath in Test).value.files.map(_.getAbsolutePath).mkString(":").stripSuffix(":"),
+      "JAVA_HOME" -> sys.env.get("JAVA_HOME").getOrElse(sys.props("java.home"))),
     javaOptions in Test += "-Dspark.test.home=" + sparkHome,
     javaOptions in Test += "-Dspark.testing=1",
     javaOptions in Test += "-Dspark.port.maxRetries=100",
     javaOptions in Test += "-Dspark.ui.enabled=false",
     javaOptions in Test += "-Dspark.ui.showConsoleProgress=false",
     javaOptions in Test += "-Dspark.driver.allowMultipleContexts=true",
+    javaOptions in Test += "-Dspark.unsafe.exceptionOnMemoryLeak=true",
     javaOptions in Test += "-Dsun.io.serialization.extendedDebugInfo=true",
     javaOptions in Test ++= System.getProperties.filter(_._1 startsWith "spark")
       .map { case (k,v) => s"-D$k=$v" }.toSeq,

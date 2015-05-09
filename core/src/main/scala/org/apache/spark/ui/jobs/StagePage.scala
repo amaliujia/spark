@@ -20,54 +20,68 @@ package org.apache.spark.ui.jobs
 import java.util.Date
 import javax.servlet.http.HttpServletRequest
 
-import scala.xml.{Node, Unparsed}
+import scala.xml.{Elem, Node, Unparsed}
 
 import org.apache.commons.lang3.StringEscapeUtils
 
 import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.scheduler.{AccumulableInfo, TaskInfo}
 import org.apache.spark.ui.{ToolTips, WebUIPage, UIUtils}
 import org.apache.spark.ui.jobs.UIData._
+import org.apache.spark.ui.scope.RDDOperationGraph
 import org.apache.spark.util.{Utils, Distribution}
-import org.apache.spark.scheduler.{AccumulableInfo, TaskInfo}
 
 /** Page showing statistics and task list for a given stage */
 private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
-  private val listener = parent.listener
+  private val progressListener = parent.progressListener
+  private val operationGraphListener = parent.operationGraphListener
 
   def render(request: HttpServletRequest): Seq[Node] = {
-    listener.synchronized {
+    progressListener.synchronized {
       val parameterId = request.getParameter("id")
       require(parameterId != null && parameterId.nonEmpty, "Missing id parameter")
 
       val parameterAttempt = request.getParameter("attempt")
       require(parameterAttempt != null && parameterAttempt.nonEmpty, "Missing attempt parameter")
 
+      // If this is set, expand the dag visualization by default
+      val expandDagVizParam = request.getParameter("expandDagViz")
+      val expandDagViz = expandDagVizParam != null && expandDagVizParam.toBoolean
+
       val stageId = parameterId.toInt
       val stageAttemptId = parameterAttempt.toInt
-      val stageDataOption = listener.stageIdToData.get((stageId, stageAttemptId))
+      val stageDataOption = progressListener.stageIdToData.get((stageId, stageAttemptId))
 
-      if (stageDataOption.isEmpty || stageDataOption.get.taskData.isEmpty) {
+      val stageHeader = s"Details for Stage $stageId (Attempt $stageAttemptId)"
+      if (stageDataOption.isEmpty) {
+        val content =
+          <div id="no-info">
+            <p>No information to display for Stage {stageId} (Attempt {stageAttemptId})</p>
+          </div>
+        return UIUtils.headerSparkPage(stageHeader, content, parent)
+
+      }
+      if (stageDataOption.get.taskData.isEmpty) {
         val content =
           <div>
             <h4>Summary Metrics</h4> No tasks have started yet
             <h4>Tasks</h4> No tasks have started yet
           </div>
-        return UIUtils.headerSparkPage(
-          s"Details for Stage $stageId (Attempt $stageAttemptId)", content, parent)
+        return UIUtils.headerSparkPage(stageHeader, content, parent)
       }
 
       val stageData = stageDataOption.get
       val tasks = stageData.taskData.values.toSeq.sortBy(_.taskInfo.launchTime)
 
       val numCompleted = tasks.count(_.taskInfo.finished)
-      val accumulables = listener.stageIdToData((stageId, stageAttemptId)).accumulables
+      val accumulables = progressListener.stageIdToData((stageId, stageAttemptId)).accumulables
       val hasAccumulators = accumulables.size > 0
 
       val summary =
         <div>
           <ul class="unstyled">
             <li>
-              <strong>Total task time across all tasks: </strong>
+              <strong>Total Time Across All Tasks: </strong>
               {UIUtils.formatDuration(stageData.executorRunTime)}
             </li>
             {if (stageData.hasInput) {
@@ -84,25 +98,25 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
             }}
             {if (stageData.hasShuffleRead) {
               <li>
-                <strong>Shuffle read: </strong>
+                <strong>Shuffle Read: </strong>
                 {s"${Utils.bytesToString(stageData.shuffleReadTotalBytes)} / " +
                  s"${stageData.shuffleReadRecords}"}
               </li>
             }}
             {if (stageData.hasShuffleWrite) {
               <li>
-                <strong>Shuffle write: </strong>
+                <strong>Shuffle Write: </strong>
                  {s"${Utils.bytesToString(stageData.shuffleWriteBytes)} / " +
                  s"${stageData.shuffleWriteRecords}"}
               </li>
             }}
             {if (stageData.hasBytesSpilled) {
               <li>
-                <strong>Shuffle spill (memory): </strong>
+                <strong>Shuffle Spill (Memory): </strong>
                 {Utils.bytesToString(stageData.memoryBytesSpilled)}
               </li>
               <li>
-                <strong>Shuffle spill (disk): </strong>
+                <strong>Shuffle Spill (Disk): </strong>
                 {Utils.bytesToString(stageData.diskBytesSpilled)}
               </li>
             }}
@@ -113,10 +127,10 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
         <div>
           <span class="expand-additional-metrics">
             <span class="expand-additional-metrics-arrow arrow-closed"></span>
-            <strong>Show additional metrics</strong>
+            <a>Show Additional Metrics</a>
           </span>
           <div class="additional-metrics collapsed">
-            <ul style="list-style-type:none">
+            <ul>
               <li>
                   <input type="checkbox" id="select-all-metrics"/>
                   <span class="additional-metric-title"><em>(De)select All</em></span>
@@ -169,8 +183,19 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
           </div>
         </div>
 
+      val dagViz = UIUtils.showDagVizForStage(
+        stageId, operationGraphListener.getOperationGraphForStage(stageId))
+
+      val maybeExpandDagViz: Seq[Node] =
+        if (expandDagViz) {
+          UIUtils.expandDagVizOnLoad(forJob = false)
+        } else {
+          Seq.empty
+        }
+
       val accumulableHeaders: Seq[String] = Seq("Accumulable", "Value")
-      def accumulableRow(acc: AccumulableInfo) = <tr><td>{acc.name}</td><td>{acc.value}</td></tr>
+      def accumulableRow(acc: AccumulableInfo): Elem =
+        <tr><td>{acc.name}</td><td>{acc.value}</td></tr>
       val accumulableTable = UIUtils.listingTable(accumulableHeaders, accumulableRow,
         accumulables.values.toSeq)
 
@@ -268,11 +293,7 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
             </td> +: getFormattedTimeQuantiles(serializationTimes)
 
           val gettingResultTimes = validTasks.map { case TaskUIData(info, _, _) =>
-            if (info.gettingResultTime > 0) {
-              (info.finishTime - info.gettingResultTime).toDouble
-            } else {
-              0.0
-            }
+            getGettingResultTime(info).toDouble
           }
           val gettingResultQuantiles =
             <td>
@@ -293,10 +314,11 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
           val schedulerDelayQuantiles = schedulerDelayTitle +:
             getFormattedTimeQuantiles(schedulerDelays)
 
-          def getFormattedSizeQuantiles(data: Seq[Double]) =
+          def getFormattedSizeQuantiles(data: Seq[Double]): Seq[Elem] =
             getDistributionQuantiles(data).map(d => <td>{Utils.bytesToString(d.toLong)}</td>)
 
-          def getFormattedSizeQuantilesWithRecords(data: Seq[Double], records: Seq[Double]) = {
+          def getFormattedSizeQuantilesWithRecords(data: Seq[Double], records: Seq[Double])
+            : Seq[Elem] = {
             val recordDist = getDistributionQuantiles(records).iterator
             getDistributionQuantiles(data).map(d =>
               <td>{s"${Utils.bytesToString(d.toLong)} / ${recordDist.next().toLong}"}</td>
@@ -435,6 +457,8 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
 
       val content =
         summary ++
+        dagViz ++
+        maybeExpandDagViz ++
         showAdditionalMetrics ++
         <h4>Summary Metrics for {numCompleted} Completed Tasks</h4> ++
         <div>{summaryTable.getOrElse("No tasks have reported metrics yet.")}</div> ++
@@ -442,7 +466,7 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
         maybeAccumulableTable ++
         <h4>Tasks</h4> ++ taskTable
 
-      UIUtils.headerSparkPage("Details for Stage %d".format(stageId), content, parent)
+      UIUtils.headerSparkPage(stageHeader, content, parent, showVisualization = true)
     }
   }
 
@@ -462,7 +486,7 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
       val gcTime = metrics.map(_.jvmGCTime).getOrElse(0L)
       val taskDeserializationTime = metrics.map(_.executorDeserializeTime).getOrElse(0L)
       val serializationTime = metrics.map(_.resultSerializationTime).getOrElse(0L)
-      val gettingResultTime = info.gettingResultTime
+      val gettingResultTime = getGettingResultTime(info)
 
       val maybeAccumulators = info.accumulables
       val accumulatorsReadable = maybeAccumulators.map{acc => s"${acc.name}: ${acc.update.get}"}
@@ -625,6 +649,19 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
     <td>{errorSummary}{details}</td>
   }
 
+  private def getGettingResultTime(info: TaskInfo): Long = {
+    if (info.gettingResultTime > 0) {
+      if (info.finishTime > 0) {
+        info.finishTime - info.gettingResultTime
+      } else {
+        // The task is still fetching the result.
+        System.currentTimeMillis - info.gettingResultTime
+      }
+    } else {
+      0L
+    }
+  }
+
   private def getSchedulerDelay(info: TaskInfo, metrics: TaskMetrics): Long = {
     val totalExecutionTime =
       if (info.gettingResult) {
@@ -636,6 +673,8 @@ private[ui] class StagePage(parent: StagesTab) extends WebUIPage("stage") {
       }
     val executorOverhead = (metrics.executorDeserializeTime +
       metrics.resultSerializationTime)
-    math.max(0, totalExecutionTime - metrics.executorRunTime - executorOverhead)
+    math.max(
+      0,
+      totalExecutionTime - metrics.executorRunTime - executorOverhead - getGettingResultTime(info))
   }
 }

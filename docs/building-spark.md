@@ -23,6 +23,18 @@ build/mvn -Pyarn -Phadoop-2.4 -Dhadoop.version=2.4.0 -DskipTests clean package
 
 Other build examples can be found below.
 
+**Note:** When building on an encrypted filesystem (if your home directory is encrypted, for example), then the Spark build might fail with a "Filename too long" error. As a workaround, add the following in the configuration args of the `scala-maven-plugin` in the project `pom.xml`:
+
+    <arg>-Xmax-classfile-name</arg>
+    <arg>128</arg>
+
+and in `project/SparkBuild.scala` add:
+
+    scalacOptions in Compile ++= Seq("-Xmax-classfile-name", "128"),
+
+to the `sharedSettings` val. See also [this PR](https://github.com/apache/spark/pull/2883/files) if you are unsure of where to add these lines.
+
+
 # Setting up Maven's Memory Usage
 
 You'll need to configure Maven to use more memory than usual by setting `MAVEN_OPTS`. We recommend the following settings:
@@ -54,7 +66,6 @@ Because HDFS is not protocol-compatible across versions, if you want to read fro
     <tr><th>Hadoop version</th><th>Profile required</th></tr>
   </thead>
   <tbody>
-    <tr><td>0.23.x</td><td>hadoop-0.23</td></tr>
     <tr><td>1.x to 2.1.x</td><td>(none)</td></tr>
     <tr><td>2.2.x</td><td>hadoop-2.2</td></tr>
     <tr><td>2.3.x</td><td>hadoop-2.3</td></tr>
@@ -70,9 +81,6 @@ mvn -Dhadoop.version=1.2.1 -DskipTests clean package
 
 # Cloudera CDH 4.2.0 with MapReduce v1
 mvn -Dhadoop.version=2.0.0-mr1-cdh4.2.0 -DskipTests clean package
-
-# Apache Hadoop 0.23.x
-mvn -Phadoop-0.23 -Dhadoop.version=0.23.7 -DskipTests clean package
 {% endhighlight %}
 
 You can enable the "yarn" profile and optionally set the "yarn.version" property if it is different from "hadoop.version". Spark only supports YARN versions 2.2.0 and later.
